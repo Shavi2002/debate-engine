@@ -36,9 +36,9 @@ generateDebateConfig()          ← GPT-4o bootstraps sides, goal, 4 gaps, seed 
 │                                              │
 │  pro-agent ──► beliefs.after(webContent)     │
 │  anti-agent ──► beliefs.after(webContent)    │
-│                          │                  │
-│              SDK fuses, scores, detects      │
-│              contradictions automatically    │
+│                          │                   │
+│              SDK fuses, scores, detects       │
+│              contradictions automatically     │
 └──────────────────────────────────────────────┘
      │
      ▼
@@ -47,10 +47,10 @@ judge.read()                    ← full fused belief graph
      ├──► debateDirector()      ← GPT-4o reads world.moves[] → writes Exa queries
      │         │
      │         ▼
-     │    Exa web search → beliefs.after() → repeat
+     │    Exa web search → beliefs.after() → repeat N rounds
      │
      ▼
-judge.before()                  ← structured briefing prompt
+judge.before()                  ← structured briefing prompt injected into GPT-4o
      │
      ▼
 GPT-4o Verdict                  ← grounded in belief graph, not raw web text
@@ -58,167 +58,146 @@ GPT-4o Verdict                  ← grounded in belief graph, not raw web text
 
 ---
 
-## SDK Methods Used
+## Project Structure
 
-| Method | Where | Purpose |
-|--------|-------|---------|
-| `new Beliefs({ agent, namespace })` | `debate-runner.ts` | Three agents, one namespace — pro, anti, judge |
-| `beliefs.add([...], { type: 'gap' })` | Seed phase | Bootstrap 4 investigable unknowns |
-| `beliefs.add({ type: 'goal' })` | Seed phase | Set the debate objective |
-| `beliefs.after(webContent)` | Per source | Extract beliefs from Exa page text |
-| `beliefs.read()` | Director loop | Full world state: beliefs, gaps, contradictions, moves |
-| `beliefs.before()` | Judge verdict | Structured system prompt for GPT-4o |
-| `beliefs.resolve(gap)` | Per round | Close gaps answered by evidence |
-| `beliefs.snapshot()` | UI polling | Lightweight state read without clarity recomputation |
+```
+debate-ui/
+├── app/
+│   ├── page.tsx                  # Main UI — live SSE rendering
+│   ├── api/
+│   │   ├── debate/route.ts       # SSE stream — runs the debate loop
+│   │   └── verdict/route.ts      # Judge verdict endpoint
+├── src/
+│   └── lib/
+│       └── debate-runner.ts      # Core debate logic
+└── .env.local                    # API keys
+```
 
-### Multi-Agent Shared Namespace Pattern
+---
 
+## How It Works
+
+### 1. Config Bootstrap
+GPT-4o takes the user's question and generates the debate configuration:
+- Two named sides (pro / anti) with distinct research angles
+- A single overarching goal node
+- 4 investigable gap nodes (things the system doesn't know yet)
+- Seed search queries for round 1
+
+### 2. Belief Agents — Shared Namespace
 ```ts
-const proAgent  = new Beliefs({ apiKey, agent: 'pro-smoking',  namespace: ns })
-const antiAgent = new Beliefs({ apiKey, agent: 'anti-smoking', namespace: ns })
-const judge     = new Beliefs({ apiKey, agent: 'judge',        namespace: ns })
+const proAgent  = new Beliefs({ apiKey, agent: 'pro',   namespace: ns })
+const antiAgent = new Beliefs({ apiKey, agent: 'anti',  namespace: ns })
+const judge     = new Beliefs({ apiKey, agent: 'judge', namespace: ns })
 
 // All three agents write to and read from the same belief graph.
-// The SDK fuses their outputs automatically — no diff logic needed.
+// The SDK fuses their outputs — no manual diffing needed.
 ```
 
-### Director Loop (rounds ≥ 3)
+### 3. The Round Loop
+Each round:
+1. `judge.read()` — snapshot the full world state
+2. `debateDirector()` — GPT-4o reads `world.moves[]` (ranked by expected information gain) and writes Exa queries
+3. Both agents run Exa searches in parallel
+4. Each result page is fed into `agent.after(webContent)` — the SDK extracts beliefs, scores confidence, detects contradictions
+5. Resolved gaps are closed with `beliefs.resolve(gap)`
+6. State is streamed to the UI via SSE
 
+### 4. Early Exit
+The runner exits when the SDK signals diminishing returns:
 ```ts
-const world = await judge.read()
-// world.moves[] are already ranked by expected information gain
-// GPT-4o's only job is translating world.moves[0].target into Exa search strings
-
-const plan = await debateDirector(world, roundNum)
-// → { pro: { query1, query2 }, anti: { query1, query2 }, reasoning }
+const shouldStop =
+  world.moves.length === 0          ||  // no further high-value actions
+  topMove.value < 0.1               ||  // expected information gain near zero
+  (world.gaps.length === 0 &&
+   world.contradictions.length >= CONTRADICTION_THRESHOLD)
 ```
 
-### Clarity-Suppression Under Conflict
+### 5. Judge Verdict
+```ts
+const context = await judge.before()   // structured belief-graph briefing
+// context.prompt is injected into GPT-4o as system prompt
+// The LLM summarises the belief graph, not the raw web
+```
+
+---
+
+## SDK Methods
+
+| Method | Purpose |
+|--------|---------|
+| `new Beliefs({ agent, namespace })` | Three agents sharing one namespace |
+| `beliefs.add([...], { type: 'gap' })` | Seed 4 investigable unknowns |
+| `beliefs.add({ type: 'goal' })` | Set the debate objective |
+| `beliefs.after(webContent)` | Extract + fuse beliefs from Exa page text |
+| `beliefs.read()` | Full world state: beliefs, gaps, contradictions, moves |
+| `beliefs.before()` | Structured system prompt for GPT-4o verdict |
+| `beliefs.resolve(gap)` | Explicitly close a gap answered by evidence |
+| `beliefs.snapshot()` | Lightweight state read for UI polling |
+
+---
+
+## The Clarity Score
 
 Clarity is **not** a quality score — it's epistemic readiness, computed across four channels:
 
 $$\text{clarity} = f(\underbrace{\text{decisionResolution}}_{\text{goals met}},\ \underbrace{\text{knowledgeCertainty}}_{\text{high-confidence beliefs}},\ \underbrace{\text{coherence}}_{\text{low contradictions}},\ \underbrace{\text{coverage}}_{\text{gaps closed}})$$
 
-On contested topics, `coherence` stays suppressed. A clarity of `0.41` after 53 sources is **correct behavior** — the system knows it doesn't know.
+> A clarity of `0.41` after 53 ingested sources is **correct behavior** — on a genuinely contested topic, the `coherence` channel stays suppressed. The system knows it doesn't know.
 
 ---
 
-## Projects
+## UI Walkthrough
 
-### `debate-ui/` — Next.js Web App
-
-Live streaming debate UI with SSE event rendering.
-
-```bash
-cd debate-ui
-cp .env.local.example .env.local   # fill in keys
-npm install
-npm run dev
-# → http://localhost:3000
-```
-
-**Environment variables:**
-```env
-BELIEFS_KEY=bel_live_...
-EXA_API_KEY=...
-OPENAI_API_KEY=...
-```
-
-### `demos/` — SDK Demos (CLI)
-
-Step-by-step walkthroughs of every SDK method.
-
-```bash
-cd demos
-cp .env.example .env   # fill in BELIEFS_KEY
-npm install
-
-npm run 01    # add() — single belief
-npm run 02    # add() — multiple types
-npm run 03    # after() — extraction from prose
-npm run 04    # before() — LLM priming
-npm run 05    # read() vs snapshot()
-npm run 06    # search()
-npm run 07    # resolve() — closing a gap
-npm run 08    # trace() — audit trail
-npm run 09    # contradictions — multi-agent conflict
-npm run 10    # core agent loop
-npm run 11    # blocksworld — planning with beliefs
-npm run 12    # EV debate — full debate with Exa
-npm run 13    # open debate runner — any question
-```
-
-**Run any debate from CLI:**
-```bash
-npm run 13 -- "Will AI replace most human workers by 2035?"
-```
-
-### `political-lens/` — Multi-Source Bias Analyzer
-
-Feeds the same news event from three editorially distinct outlets (optimist / neutral / skeptic) into a shared belief namespace and produces a structured clarity audit.
-
-```bash
-cd political-lens
-npm install
-BELIEFS_KEY=bel_live_... npm start
-```
-
-**Output includes:**
-- Clarity score (0–1) with per-channel breakdown
-- Claims sorted by confidence
-- Cross-outlet contradictions detected
-- Gaps none of the sources addressed
-- Full belief transition trail via `trace()`
-
----
-
-## Key Concepts
-
-### Beliefs vs Memory
-
-| Memory / RAG | Beliefs SDK |
-|---|---|
-| Stores text | Models understanding |
-| No confidence tracking | Every claim has a confidence score |
-| Silent contradictions | Explicit contradiction detection |
-| No gap awareness | Gaps are first-class nodes |
-| No readiness signal | `clarity` + `readiness` tell you when to act |
-
-### Confidence Tiers (Judge Panel)
-
-| Label | Range | Meaning |
-|-------|-------|---------|
-| **Established** | > 0.70 | Supported by multiple consistent sources |
-| **Contested** | 0.40–0.70 | Claimed but contradicted or weakly supported |
-| **Weak** | < 0.40 | Single source, low-confidence, or disputed |
-
-### Early Exit Logic
-
-The debate runner exits early when the SDK signals diminishing returns:
-
-```ts
-const shouldStop =
-  world.moves.length === 0 ||          // no further high-value actions
-  topMove.value < 0.1 ||               // expected gain near zero
-  (world.gaps.length === 0 &&
-   world.contradictions.length >= CONTRADICTION_THRESHOLD)
-```
-
----
-
-## Scorecard Fields
-
+### Header — Scorecard
 | Field | Description |
 |-------|-------------|
 | `Total beliefs` | All claim nodes in the fused namespace |
 | `Established >0.70` | High-confidence, consistent beliefs |
 | `Contested 0.40–0.70` | Disputed or partially supported |
-| `Weak <0.40` | Low signal |
+| `Weak <0.40` | Low signal — single source or contradicted |
 | `Contradictions` | Semantic conflicts detected across sources |
 | `Open gaps` | Unknowns still unresolved |
-| `Gaps resolved` | Gaps explicitly closed by evidence |
-| `Judge clarity` | Overall epistemic readiness score |
+| `Gaps resolved` | Gaps explicitly closed via `beliefs.resolve()` |
+| `Judge clarity` | Overall epistemic readiness (0–1) |
 | `Sources ingested` | Total Exa pages fed via `after()` |
+
+### Round Cards
+- **Director line** (cyan italic) — GPT-4o's reasoning from `world.moves[]`
+- **Next-round value** — SDK's expected information gain for the next round
+- **Source list** — Exa pages fed into `beliefs.after()`
+- **⚡ Conflicts badge** — contradictions detected in this round
+- **WHAT CONFLICTED** — the specific belief pairs that semantically negate each other
+- **Clarity bars** — per-agent clarity after round completion
+- **Resolved chip** (green) — gap closed this round via `beliefs.resolve()`
+
+### GPT-4o Verdict
+Verdict sections map directly to belief graph confidence tiers — the structure comes from the SDK, not prompt engineering:
+
+| Verdict Section | Belief Tier |
+|----------------|-------------|
+| Evidence clearly supports | Established `> 0.70` |
+| Actively contested | Contested `0.40–0.70` |
+| Genuinely unknown | Open gaps |
+
+---
+
+## Setup
+
+```bash
+cd debate-ui
+cp .env.local.example .env.local
+npm install
+npm run dev
+# → http://localhost:3000
+```
+
+**.env.local**
+```env
+BELIEFS_KEY=bel_live_...
+EXA_API_KEY=...
+OPENAI_API_KEY=...
+```
 
 ---
 
@@ -228,8 +207,8 @@ const shouldStop =
 |---------|---------|
 | [`beliefs`](https://thinkn.ai/dev) | Epistemic belief state SDK |
 | [`exa-js`](https://exa.ai) | Neural web search for real-time evidence |
-| [`openai`](https://platform.openai.com) | GPT-4o for director + verdict |
-| [`next`](https://nextjs.org) | Web UI (debate-ui) |
+| [`openai`](https://platform.openai.com) | GPT-4o for director reasoning + verdict |
+| [`next`](https://nextjs.org) | Web UI + SSE streaming |
 
 ---
 
@@ -244,8 +223,5 @@ const shouldStop =
 ## Further Reading
 
 - [Why beliefs over memory?](https://thinkn.ai/dev/why/problem)
-- [Full SDK API reference](https://thinkn.ai/dev/sdk/core-api)
-- [Framework integration patterns](https://thinkn.ai/dev/sdk/patterns)
-- [Vercel AI adapter](https://thinkn.ai/dev/adapters/vercel-ai)
-- [Claude Agent SDK adapter](https://thinkn.ai/dev/adapters/claude-agent-sdk)
+- [Full SDK reference](https://thinkn.ai/dev)
 - [Hackathon guide](https://thinkn.ai/dev/start/hack-guide)

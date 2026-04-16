@@ -5,7 +5,7 @@ import { generateDebateConfig, runDebate } from '@/src/lib/debate-runner';
 import type { DebateEvent } from '@/src/types/debate';
 
 // Allow long-running debates (up to 10 minutes in production)
-export const maxDuration = 600;
+export const maxDuration = 300;
 export const dynamic = 'force-dynamic';
 
 function guardEnv(key: string): string {

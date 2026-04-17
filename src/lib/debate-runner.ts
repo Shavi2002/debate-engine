@@ -1,10 +1,12 @@
 /**
- * debate-runner.ts — UI-optimised debate engine (no terminal output)
+ * debate-runner.ts — UI-optimised debate engine (patched)
  *
- * Identical logic to demos/src/debate-runner.ts but:
- *   • No _print.js / ANSI dependency
- *   • All progress is emitted as structured DebateEvent objects via onEvent
- *   • GPT-4o verdict is streamed as verdict_chunk events instead of printed
+ * Key fixes from thinkn.ai hack guide audit:
+ *   1. PRO/ANTI agents now call before() before each round to get belief context
+ *   2. Exa raw text is synthesized through GPT-4o BEFORE being fed to after()
+ *      This filters boilerplate and grounds new research in existing beliefs
+ *   3. debateDirector() now injects judge.before() prompt into its system context
+ *   4. BeliefsError rate-limit handling with exponential backoff
  */
 
 import { Exa } from 'exa-js';
@@ -27,6 +29,30 @@ export interface DebateDeps {
   exa: Exa;
   openai: OpenAI;
   onEvent: (e: DebateEvent) => void;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rate-limit safe wrapper
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const e = err as { retryable?: boolean; retryAfterMs?: number; message?: string };
+      const isRateLimit =
+        e?.retryable === true ||
+        (typeof e?.message === 'string' && e.message.includes('rate_limit'));
+      if (isRateLimit && attempt < maxAttempts - 1) {
+        const wait = e?.retryAfterMs ?? (1000 * 2 ** attempt);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('withRetry exhausted');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +149,6 @@ export async function generateDebateConfig(
         'Unknown: historical precedents relevant to this question',
         'Unknown: quantitative projections and uncertainty ranges',
       ],
-      // Store seedPlans alongside the config for use by runDebate
       ...(parsed.seedPlans ? { seedPlans: parsed.seedPlans } : {}),
     } as DebateConfig & { seedPlans?: DirectorPlan[] };
   } catch {
@@ -190,7 +215,6 @@ export async function runDebate(
 ): Promise<void> {
   const { apiKey, exa, openai, onEvent } = deps;
   const MAX_ROUNDS = config.maxRounds ?? 6;
-  const CLARITY_THRESHOLD = 0.35;
   const CONTRADICTION_THRESHOLD = 2;
   const REANCHOR_INTERVAL = 2;
 
@@ -202,50 +226,51 @@ export async function runDebate(
     .replace(/-+$/, '');
   const ns = `${slug}-${Date.now()}`;
 
-  const proAgent = new Beliefs({
-    apiKey,
-    agent: config.sides.pro.name,
-    namespace: ns,
-    writeScope: 'space',
-    baseUrl: 'https://www.thinkn.ai',
-  });
-  const antiAgent = new Beliefs({
-    apiKey,
-    agent: config.sides.anti.name,
-    namespace: ns,
-    writeScope: 'space',
-    baseUrl: 'https://www.thinkn.ai',
-  });
-  const judge = new Beliefs({
-    apiKey,
-    agent: 'judge',
-    namespace: ns,
-    writeScope: 'space',
-    baseUrl: 'https://www.thinkn.ai',
-  });
+  const makeAgent = (agentName: string) =>
+    new Beliefs({
+      apiKey,
+      agent: agentName,
+      namespace: ns,
+      writeScope: 'space',
+      baseUrl: 'https://www.thinkn.ai',
+    });
+
+  const proAgent  = makeAgent(config.sides.pro.name);
+  const antiAgent = makeAgent(config.sides.anti.name);
+  const judge     = makeAgent('judge');
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
   function pickSearchType(moveAction: string): 'fast' | 'auto' | 'deep' {
     if (moveAction === 'clarify') return 'fast';
-    if (moveAction === 'resolve_uncertainty' || moveAction === 'compare_paths')
-      return 'deep';
+    if (moveAction === 'resolve_uncertainty' || moveAction === 'compare_paths') return 'deep';
     return 'auto';
   }
 
   const seenUrls = new Set<string>();
 
+  /**
+   * PATCHED searchAndFeed:
+   * 1. Fetches Exa results as before
+   * 2. Calls agent.before() to get current belief context — FIX #1
+   * 3. Runs GPT-4o to synthesize web content IN LIGHT OF existing beliefs — FIX #2
+   *    (filters boilerplate, avoids re-stating established claims, extracts new signal)
+   * 4. Feeds the GPT-4o synthesis to agent.after() — cleaner input = better extraction
+   */
   async function searchAndFeed(
     agent: Beliefs,
     queries: string[],
     source: string,
     moveAction = 'gather_evidence',
+    sideLabel: string,
   ): Promise<{
     delta: BeliefDelta;
     sources: Array<{ title: string | null; url: string }>;
   }> {
     const searchType = pickSearchType(moveAction);
+
+    // Fetch web content
     const results = await Promise.all(
-      queries.map((q) =>
+      queries.map(q =>
         exa.searchAndContents(q, {
           numResults: 3,
           type: searchType,
@@ -263,23 +288,15 @@ export async function runDebate(
         sources.push({ title: r.title, url: r.url });
         const content = (r as { text?: string }).text ?? '';
         if (content.length >= 200)
-          parts.push(
-            `[Source: ${r.title ?? r.url}]\n${content.slice(0, 14000)}`,
-          );
+          parts.push(`[Source: ${r.title ?? r.url}]\n${content.slice(0, 14000)}`);
       }
     }
-    const combined = parts.join('\n\n');
 
-    if (!combined) {
-      const world = await agent.read();
+    if (parts.length === 0) {
+      const world = await withRetry(() => agent.read());
       const noOpDelta: BeliefDelta = {
         clarity: world.clarity,
-        readiness:
-          world.clarity >= 0.7
-            ? 'high'
-            : world.clarity >= 0.4
-              ? 'medium'
-              : 'low',
+        readiness: world.clarity >= 0.7 ? 'high' : world.clarity >= 0.4 ? 'medium' : 'low',
         changes: [],
         moves: world.moves ?? [],
         state: {
@@ -291,18 +308,54 @@ export async function runDebate(
       return { delta: noOpDelta, sources: [] };
     }
 
-    const delta = await agent.after(combined, { source });
+    const rawWebText = parts.join('\n\n');
+
+    // FIX #1: Call before() to get current belief context
+    const beliefContext = await withRetry(() => agent.before());
+
+    // FIX #2: Synthesize web content through GPT-4o using belief context as system prompt
+    // This: (a) filters HTML boilerplate/nav noise, (b) avoids restating established beliefs,
+    // (c) focuses extraction on genuinely new claims, (d) tags source evidence properly
+    let synthesizedText: string;
+    try {
+      const synthesis = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        temperature: 0.2,
+        max_tokens: 2000,
+        messages: [
+          {
+            role: 'system',
+            content:
+              beliefContext.prompt +
+              `\n\n---\nYou are the ${sideLabel} research agent in an epistemic debate on: "${config.topic}".\n` +
+              `Your task: Extract the key factual claims, statistics, and evidence from the web sources below.\n` +
+              `Rules:\n` +
+              `- State each claim clearly and specifically with any numbers, dates, or citations present.\n` +
+              `- Do NOT repeat claims already established in your belief state above.\n` +
+              `- Focus on NEW information that adds to, contradicts, or qualifies existing beliefs.\n` +
+              `- If a source contradicts an existing belief, state both positions explicitly.\n` +
+              `- Write 10-20 factual statements. No opinions, no summaries of your role.`,
+          },
+          {
+            role: 'user',
+            content: rawWebText.slice(0, 60000),
+          },
+        ],
+      });
+      synthesizedText = synthesis.choices[0]?.message?.content ?? rawWebText.slice(0, 8000);
+    } catch {
+      // If synthesis fails (e.g. rate limit on OpenAI), fall back to raw text
+      synthesizedText = rawWebText.slice(0, 8000);
+    }
+
+    // Feed synthesized text — much cleaner signal for the beliefs SDK
+    const delta = await withRetry(() => agent.after(synthesizedText, { source }));
 
     if (delta.clarity === 0 && delta.changes.length === 0) {
-      const world = await agent.read();
+      const world = await withRetry(() => agent.read());
       const noOpDelta: BeliefDelta = {
         clarity: world.clarity,
-        readiness:
-          world.clarity >= 0.7
-            ? 'high'
-            : world.clarity >= 0.4
-              ? 'medium'
-              : 'low',
+        readiness: world.clarity >= 0.7 ? 'high' : world.clarity >= 0.4 ? 'medium' : 'low',
         changes: [],
         moves: world.moves ?? [],
         state: {
@@ -313,36 +366,45 @@ export async function runDebate(
       };
       return { delta: noOpDelta, sources };
     }
+
     return { delta, sources };
   }
 
+  /**
+   * PATCHED debateDirector:
+   * FIX #3: Now injects judge.before() prompt into GPT-4o system context
+   * so the director's query generation is grounded in the actual belief graph state
+   */
   async function debateDirector(
     world: Awaited<ReturnType<typeof judge.read>>,
     roundNum: number,
   ): Promise<DirectorPlan> {
     const agentMoves = (world.moves ?? [])
-      .filter((m) => m.executor !== 'user')
+      .filter(m => m.executor !== 'user')
       .slice(0, 4);
-    const proMove = agentMoves[0];
+    const proMove  = agentMoves[0];
     const antiMove = agentMoves[1] ?? agentMoves[0];
-    const proTarget = proMove?.target ?? world.gaps[0] ?? config.topic;
-    const antiTarget =
-      antiMove?.target ?? world.gaps[1] ?? world.gaps[0] ?? config.topic;
-    const topValue = proMove?.value ?? 0;
+    const proTarget  = proMove?.target  ?? world.gaps[0] ?? config.topic;
+    const antiTarget = antiMove?.target ?? world.gaps[1] ?? world.gaps[0] ?? config.topic;
+    const topValue   = proMove?.value ?? 0;
 
     const shouldStop =
       world.moves.length === 0 ||
       topValue < 0.1 ||
-      (world.gaps.length === 0 &&
-        world.contradictions.length >= CONTRADICTION_THRESHOLD);
+      (world.gaps.length === 0 && world.contradictions.length >= CONTRADICTION_THRESHOLD);
+
+    // FIX #3: get judge's current belief brief
+    const judgeContext = await withRetry(() => judge.before());
 
     const systemPrompt =
-      `You are a search query generator for an epistemic debate on: "${config.topic}"\n\n` +
+      judgeContext.prompt +  // inject structured belief graph as system context
+      `\n\n---\nYou are a search query generator for an epistemic debate on: "${config.topic}"\n\n` +
       `Your ONLY job: translate two investigation targets into specific Exa web-search queries.\n` +
       `Rules:\n` +
-      `1. Each target gets 2 queries covering DIFFERENT facets.\n` +
-      `2. Queries must be specific and cite-worthy.\n` +
-      `3. Output ONLY valid JSON.\n\n` +
+      `1. Each target gets 2 queries covering DIFFERENT facets — do not duplicate.\n` +
+      `2. Queries must be specific and cite-worthy (think paper titles or news headlines).\n` +
+      `3. Avoid querying topics already well-established in the belief graph above.\n` +
+      `4. Output ONLY valid JSON.\n\n` +
       `JSON shape:\n` +
       `{ "pro": { "angle": "...", "query1": "...", "query2": "..." }, "anti": { "angle": "...", "query1": "...", "query2": "..." }, "reasoning": "one sentence" }`;
 
@@ -363,19 +425,10 @@ export async function runDebate(
 
     const raw = completion.choices[0].message.content ?? '{}';
     try {
-      const parsed = JSON.parse(raw) as Omit<
-        DirectorPlan,
-        'suggestStop' | 'moveValue'
-      >;
+      const parsed = JSON.parse(raw) as Omit<DirectorPlan, 'suggestStop' | 'moveValue'>;
       return {
-        pro: {
-          ...parsed.pro,
-          moveAction: proMove?.action ?? 'gather_evidence',
-        },
-        anti: {
-          ...parsed.anti,
-          moveAction: antiMove?.action ?? 'gather_evidence',
-        },
+        pro:  { ...parsed.pro,  moveAction: proMove?.action  ?? 'gather_evidence' },
+        anti: { ...parsed.anti, moveAction: antiMove?.action ?? 'gather_evidence' },
         reasoning: parsed.reasoning,
         moveValue: topValue,
         suggestStop: shouldStop,
@@ -402,10 +455,12 @@ export async function runDebate(
   }
 
   // ── Seed shared goal + gaps ──────────────────────────────────────────────────
-  await proAgent.add([
-    { text: config.seedGoal, type: 'goal' },
-    ...config.seedGaps.map((text) => ({ text, type: 'gap' as const })),
-  ]);
+  await withRetry(() =>
+    proAgent.add([
+      { text: config.seedGoal, type: 'goal' },
+      ...config.seedGaps.map(text => ({ text, type: 'gap' as const })),
+    ])
+  );
 
   onEvent({
     type: 'seed_done',
@@ -413,14 +468,12 @@ export async function runDebate(
     gaps: config.seedGaps,
     namespace: ns,
   });
-  console.log(
-    `[debate] seed_done namespace=${ns} gaps=${config.seedGaps.length}`,
-  );
-  await new Promise((r) => setTimeout(r, 400));
+  console.log(`[debate] seed_done namespace=${ns} gaps=${config.seedGaps.length}`);
+  await new Promise(r => setTimeout(r, 400));
 
   // ── Score + gap tracking ─────────────────────────────────────────────────────
   const score = {
-    pro: { created: 0, clarityLast: 0 },
+    pro:  { created: 0, clarityLast: 0 },
     anti: { created: 0, clarityLast: 0 },
   };
   const seedPlans: DirectorPlan[] = config.seedPlans ?? [];
@@ -428,17 +481,11 @@ export async function runDebate(
   const resolvedSeedGaps = new Set<string>();
   let reanchorIndex = 0;
 
-  // ── Conflict tracking accumulators (persistent across all rounds / both sides) ──
-  // seenContradictions: delta-scopes conflicts so each one only appears in the round
-  //   it was first detected. Pro runs first, so it claims new conflicts first;
-  //   anti only sees conflicts not already captured by pro in the same round.
-  // globalBeliefMap: accumulates beliefId→text from every delta across all rounds
-  //   and both sides, so IDs from earlier rounds are still resolvable.
   const seenContradictions = new Set<string>();
-  const globalBeliefMap = new Map<string, string>();
+  const globalBeliefMap    = new Map<string, string>();
 
   function pickReanchorTarget(): string | null {
-    const unresolved = config.seedGaps.filter((g) => !resolvedSeedGaps.has(g));
+    const unresolved = config.seedGaps.filter(g => !resolvedSeedGaps.has(g));
     if (unresolved.length === 0) return null;
     const target = unresolved[reanchorIndex % unresolved.length];
     reanchorIndex++;
@@ -452,11 +499,11 @@ export async function runDebate(
     for (const target of moveTargets) {
       if (resolvedSeedGaps.has(target) || target.length < 5) continue;
       const stillOpen = worldGaps.some(
-        (wg) => wg === target || wg.includes(target.replace('Unknown: ', '')),
+        wg => wg === target || wg.includes(target.replace('Unknown: ', '')),
       );
       if (!stillOpen) {
         resolvedSeedGaps.add(target);
-        await judge.resolve(target).catch(() => {});
+        await withRetry(() => judge.resolve(target)).catch(() => {});
         onEvent({ type: 'gap_resolved', gap: target, how: 'move' });
       }
     }
@@ -466,25 +513,24 @@ export async function runDebate(
         .replace('Unknown: ', '')
         .toLowerCase()
         .split(/\s+/)
-        .filter((w) => w.length > 4)
+        .filter(w => w.length > 4)
         .slice(0, 3);
       const stillOpen = worldGaps.some(
-        (wg) =>
-          keywords.filter((kw) => wg.toLowerCase().includes(kw)).length >= 2,
+        wg => keywords.filter(kw => wg.toLowerCase().includes(kw)).length >= 2,
       );
       if (!stillOpen) {
         resolvedSeedGaps.add(seedGap);
-        await judge.resolve(seedGap).catch(() => {});
+        await withRetry(() => judge.resolve(seedGap)).catch(() => {});
         onEvent({ type: 'gap_resolved', gap: seedGap, how: 'seed' });
       }
     }
   }
 
   // ── Debate loop ──────────────────────────────────────────────────────────────
-  let lastProDelta: BeliefDelta | null = null;
+  let lastProDelta:  BeliefDelta | null = null;
   let lastAntiDelta: BeliefDelta | null = null;
-  let earlyExit = false;
-  let roundNum = 0;
+  let earlyExit   = false;
+  let roundNum    = 0;
   const clarityHistory: number[] = [];
   let previousContradictionCount = 0;
 
@@ -496,19 +542,18 @@ export async function runDebate(
     if (roundNum <= seedPlans.length) {
       plan = seedPlans[roundNum - 1];
     } else {
-      const interimWorld = await judge.read();
+      const interimWorld = await withRetry(() => judge.read());
       moveTargetsThisRound = (interimWorld.moves ?? [])
-        .filter((m) => m.executor !== 'user')
+        .filter(m => m.executor !== 'user')
         .slice(0, 2)
-        .map((m) => m.target);
-      const reanchorTarget = pickReanchorTarget();
-      const shouldReanchor =
+        .map(m => m.target);
+
+      const reanchorTarget  = pickReanchorTarget();
+      const shouldReanchor  =
         roundsSinceReanchor >= REANCHOR_INTERVAL && reanchorTarget !== null;
 
       if (shouldReanchor) {
-        const topMove = (interimWorld.moves ?? []).find(
-          (m) => m.executor !== 'user',
-        );
+        const topMove = (interimWorld.moves ?? []).find(m => m.executor !== 'user');
         const patchedWorld = {
           ...interimWorld,
           moves: [
@@ -548,8 +593,8 @@ export async function runDebate(
     let roundNewConflictCount = 0;
 
     for (const side of ['pro', 'anti'] as const) {
-      const cfg = plan[side];
-      const agent = side === 'pro' ? proAgent : antiAgent;
+      const cfg       = plan[side];
+      const agent     = side === 'pro' ? proAgent : antiAgent;
       const sideLabel =
         side === 'pro' ? config.sides.pro.label : config.sides.anti.label;
 
@@ -560,53 +605,44 @@ export async function runDebate(
         queries: [cfg.query1, cfg.query2],
       });
 
+      // PATCHED: pass sideLabel so searchAndFeed can reference it in the GPT-4o prompt
       const { delta, sources } = await searchAndFeed(
         agent,
         [cfg.query1, cfg.query2],
         side,
         cfg.moveAction ?? 'gather_evidence',
+        sideLabel,
       );
 
       onEvent({ type: 'side_sources', side, sources });
 
-      const created = delta.changes.filter(
-        (c) => c.action === 'created',
-      ).length;
-      score[side].created += created;
+      const created = delta.changes.filter(c => c.action === 'created').length;
+      score[side].created    += created;
       score[side].clarityLast = delta.clarity;
 
-      // ── Update global belief map (persists across all rounds/sides for ID resolution) ─
-      for (const b of delta.state.beliefs as unknown as Array<
-        Record<string, unknown>
-      >) {
-        if (typeof b.id === 'string' && typeof b.text === 'string') {
+      // Update global belief map for conflict resolution
+      for (const b of delta.state.beliefs as unknown as Array<Record<string, unknown>>) {
+        if (typeof b.id === 'string' && typeof b.text === 'string')
           globalBeliefMap.set(b.id, b.text);
-        }
       }
-      for (const g of delta.state.gaps as unknown as Array<
-        Record<string, unknown>
-      >) {
-        if (typeof g.id === 'string' && typeof g.text === 'string') {
+      for (const g of delta.state.gaps as unknown as Array<Record<string, unknown>>) {
+        if (typeof g.id === 'string' && typeof g.text === 'string')
           globalBeliefMap.set(g.id, g.text);
-        }
       }
 
-      // ── Delta-scoped conflicts: only contradictions first seen this round ────
-      // Pro runs first so it claims new conflicts first; anti inherits the rest.
+      // Delta-scoped conflicts
       const allContradictions = delta.state.contradictions as unknown[];
-      const newConflicts = allContradictions.filter((c) => {
+      const newConflicts = allContradictions.filter(c => {
         const key = typeof c === 'string' ? c : String(c);
         return !seenContradictions.has(key);
       });
-      for (const c of newConflicts) {
+      for (const c of newConflicts)
         seenContradictions.add(typeof c === 'string' ? c : String(c));
-      }
       roundNewConflictCount += newConflicts.length;
 
-      // ── Build conflict pairs using globalBeliefMap for full ID→text resolution ─
-      const conflictPairs = newConflicts.map((c) => {
+      const conflictPairs = newConflicts.map(c => {
         const raw = typeof c === 'string' ? c : String(c);
-        const m = /^(.+?)\s+contradicts\s+(.+)$/i.exec(raw);
+        const m   = /^(.+?)\s+contradicts\s+(.+)$/i.exec(raw);
         if (m) {
           return {
             a: (globalBeliefMap.get(m[1].trim()) ?? m[1].trim()).slice(0, 120),
@@ -634,10 +670,10 @@ export async function runDebate(
         conflictPairs,
       });
 
-      if (side === 'pro') lastProDelta = delta;
-      else lastAntiDelta = delta;
+      if (side === 'pro') lastProDelta  = delta;
+      else                lastAntiDelta = delta;
 
-      await new Promise((res) => setTimeout(res, 400));
+      await new Promise(res => setTimeout(res, 500)); // slightly longer delay to respect rate limits
     }
 
     const proC = lastProDelta!.clarity;
@@ -646,11 +682,9 @@ export async function runDebate(
 
     await resolveClosedGaps(lastAntiDelta!.state.gaps, moveTargetsThisRound);
 
-    const newContradictions = lastAntiDelta!.state.contradictions.slice(
-      previousContradictionCount,
-    );
+    const newContradictions = lastAntiDelta!.state.contradictions.slice(previousContradictionCount);
     for (const c of newContradictions.slice(0, 3))
-      await judge.resolve(c).catch(() => {});
+      await withRetry(() => judge.resolve(c)).catch(() => {});
     previousContradictionCount = lastAntiDelta!.state.contradictions.length;
 
     clarityHistory.push((proC + antiC) / 2);
@@ -672,10 +706,7 @@ export async function runDebate(
         : 1.0;
 
     if (plan.suggestStop) {
-      onEvent({
-        type: 'early_exit',
-        reason: 'Director suggests stopping — sufficient coverage reached.',
-      });
+      onEvent({ type: 'early_exit', reason: 'Director suggests stopping — sufficient coverage reached.' });
       earlyExit = true;
     } else if (
       roundNum >= 4 &&
@@ -688,24 +719,19 @@ export async function runDebate(
       });
       earlyExit = true;
     } else if (roundNum >= 3 && proC >= 0.7 && antiC >= 0.7) {
-      onEvent({
-        type: 'early_exit',
-        reason: 'Both sides at high clarity — sufficient evidence gathered.',
-      });
+      onEvent({ type: 'early_exit', reason: 'Both sides at high clarity — sufficient evidence gathered.' });
       earlyExit = true;
     }
   }
 
-  await new Promise((r) => setTimeout(r, 400));
+  await new Promise(r => setTimeout(r, 400));
 
   // ── Judge reads the fused namespace ─────────────────────────────────────────
-  const world = await judge.read();
+  const world = await withRetry(() => judge.read());
 
-  const established = world.beliefs.filter((b) => b.confidence > 0.7);
-  const contested = world.beliefs.filter(
-    (b) => b.confidence >= 0.4 && b.confidence <= 0.7,
-  );
-  const weak = world.beliefs.filter((b) => b.confidence < 0.4);
+  const established = world.beliefs.filter(b => b.confidence > 0.7);
+  const contested   = world.beliefs.filter(b => b.confidence >= 0.4 && b.confidence <= 0.7);
+  const weak        = world.beliefs.filter(b => b.confidence < 0.4);
 
   onEvent({
     type: 'judge_state',
@@ -734,25 +760,25 @@ export async function runDebate(
       text: { maxCharacters: 20000 },
     });
     const synthText = synthResults.results
-      .filter((r) => !seenUrls.has(r.url))
-      .map(
-        (r) =>
-          `[Source: ${r.title ?? r.url}]\n${(r as { text?: string }).text ?? ''}`,
-      )
-      .filter((t) => t.length > 300)
+      .filter(r => !seenUrls.has(r.url))
+      .map(r => `[Source: ${r.title ?? r.url}]\n${(r as { text?: string }).text ?? ''}`)
+      .filter(t => t.length > 300)
       .join('\n\n');
-    if (synthText) await judge.after(synthText, { tool: 'web_search' });
+    if (synthText)
+      await withRetry(() => judge.after(synthText, { tool: 'web_search' }));
   } catch {
     // Non-fatal
   }
 
-  const verdict = await judge.before(
-    `Based on all evidence from both sides: provide a balanced epistemic assessment of: ` +
-      `"${config.topic}". What is well-established by the evidence, what is actively disputed, ` +
-      `and what remains unknown or unresolved?`,
+  // ── Verdict — judge.before() is already correctly used here ─────────────────
+  const verdict = await withRetry(() =>
+    judge.before(
+      `Based on all evidence from both sides: provide a balanced epistemic assessment of: ` +
+        `"${config.topic}". What is well-established by the evidence, what is actively disputed, ` +
+        `and what remains unknown or unresolved?`,
+    )
   );
 
-  // Stream GPT-4o verdict as events
   try {
     const verdictStream = await openai.chat.completions.create({
       model: 'gpt-4o',
@@ -774,7 +800,7 @@ export async function runDebate(
       if (text) onEvent({ type: 'verdict_chunk', text });
     }
   } catch {
-    // Emit partial verdict_done even on error
+    // Emit verdict_done even on error
   }
   onEvent({ type: 'verdict_done' });
   console.log('[debate] verdict_done — streaming complete');
@@ -782,15 +808,15 @@ export async function runDebate(
   // ── Scorecard ────────────────────────────────────────────────────────────────
   onEvent({
     type: 'scorecard',
-    proCreated: score.pro.created,
-    antiCreated: score.anti.created,
-    proClarity: score.pro.clarityLast,
-    antiClarity: score.anti.clarityLast,
+    proCreated:    score.pro.created,
+    antiCreated:   score.anti.created,
+    proClarity:    score.pro.clarityLast,
+    antiClarity:   score.anti.clarityLast,
     contradictions: world.contradictions.length,
-    gaps: world.gaps.length,
-    rounds: roundNum,
-    sources: seenUrls.size,
-    judgeClarity: verdict.clarity,
+    gaps:           world.gaps.length,
+    rounds:         roundNum,
+    sources:        seenUrls.size,
+    judgeClarity:   verdict.clarity,
   });
 
   onEvent({ type: 'done' });

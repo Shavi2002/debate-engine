@@ -5,7 +5,7 @@
 Built with [thinkn.ai beliefs SDK](https://thinkn.ai/dev) + [Exa](https://exa.ai) + GPT-4o.
 Uses thinkn.ai as the core framework to simulate a (bi-opinion) debate using multiple agents that put equal weight on advocating for and against the topic. By connecting agents to EXA API the real content like articles, research papers, blogs are pulled from the internet and fed to a belief system that semantically manages arguments, identifies contradictions and resolves knowledge gaps autonomously by pursuing the promising query directions, continuously evolving and expanding over time as more and more data is collected. The system tries to minimize confusion, maximize clarity and summarizes grounded findings at the very end.
 
-# [DEMO VIDEO](https://youtu.be/cgeO4PT6tQg)
+# [DEMO VIDEO](https://youtu.be/cgeO4PT6tQg?si=DvboGAyMCYeT7xOf)
 
 ## What It Does
 
